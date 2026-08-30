@@ -1,0 +1,245 @@
+blueprint:
+  name: PV-Überschuss Verbraucher-Automatik (SMA + Forecast.Solar)
+  description: >
+    Schaltet einen Verbraucher (z.B. Waschmaschine, Spülmaschine, Trockner) über
+    einen Smart-Plug/Relais ein, sobald genug PV-Überschuss bzw. Akkukapazität
+    vorhanden ist, um ihn ohne Netzbezug zu betreiben. Reicht die aktuelle Energie
+    nicht, aber die Tagesprognose (Forecast.Solar) schon, wird eine Benachrichtigung
+    mit einem besseren Startzeitpunkt gesendet. Reicht auch die Tagesprognose nicht,
+    wird vor unvermeidbarem Netzbezug gewarnt.
+
+    Voraussetzung: Ein input_boolean-Helfer pro Gerät ("Bereit zum Start"), den du
+    aktivierst, sobald das Gerät beladen und startbereit ist. Die Automation
+    deaktiviert diesen Helfer nicht automatisch - das kannst du optional in der
+    Aktion nach dem Einschalten ergänzen, oder manuell zurücksetzen.
+  domain: automation
+  source_url: https://www.home-assistant.io/
+  input:
+    appliance_name:
+      name: Gerätename
+      description: Freitext-Name für Benachrichtigungen, z.B. "Waschmaschine"
+      selector:
+        text: {}
+
+    appliance_switch:
+      name: Smart-Plug / Relais des Geräts
+      description: Der Schalter, über den das Gerät eingeschaltet wird
+      selector:
+        entity:
+          domain: switch
+
+    appliance_ready_helper:
+      name: "Bereitschafts-Helfer (input_boolean)"
+      description: >
+        Wird von dir manuell aktiviert, sobald das Gerät beladen/startbereit ist.
+        Lege dazu vorher unter Einstellungen -> Geräte & Dienste -> Helfer einen
+        "Ein/Aus"-Schalter (input_boolean) an, z.B. input_boolean.waschmaschine_bereit
+      selector:
+        entity:
+          domain: input_boolean
+
+    appliance_energy_wh:
+      name: Geschätzter Energiebedarf (Wh)
+      description: Ungefährer Stromverbrauch eines Programmlaufs in Wattstunden
+      default: 1000
+      selector:
+        number:
+          min: 100
+          max: 10000
+          step: 50
+          unit_of_measurement: "Wh"
+          mode: box
+
+    battery_soc_sensor:
+      name: Akku-Ladestand-Sensor (SoC)
+      description: Sensor mit dem aktuellen Ladestand des Akkus in %
+      selector:
+        entity:
+          domain: sensor
+          device_class: battery
+
+    battery_capacity_wh:
+      name: Akku-Gesamtkapazität (Wh)
+      description: Nutzbare Gesamtkapazität deines Batteriespeichers
+      selector:
+        number:
+          min: 500
+          max: 50000
+          step: 100
+          unit_of_measurement: "Wh"
+          mode: box
+
+    battery_reserve_soc:
+      name: Akku-Reserve (%)
+      description: >
+        Ladestand, der als Mindestreserve immer im Akku bleiben soll
+        (wird bei der Berechnung der verfügbaren Energie abgezogen)
+      default: 20
+      selector:
+        number:
+          min: 0
+          max: 90
+          step: 5
+          unit_of_measurement: "%"
+          mode: slider
+
+    grid_power_sensor:
+      name: Netzbezug/-einspeisung-Sensor (SMA)
+      description: >
+        SMA-Sensor für die aktuelle Netzleistung (z.B. "Netzbezug/-einspeisung").
+        Vorzeichen unten über "Netzbezug ist positiv" korrekt einstellen.
+      selector:
+        entity:
+          domain: sensor
+
+    grid_import_is_positive:
+      name: Netzbezug ist positiver Wert
+      description: >
+        Aktivieren, wenn dein Sensor bei Netzbezug (Strom aus dem Netz) einen
+        positiven Wert und bei Einspeisung/Überschuss einen negativen Wert liefert
+        (typisch für viele SMA-Sensoren). Deaktivieren, falls es umgekehrt ist.
+      default: true
+      selector:
+        boolean: {}
+
+    pv_forecast_remaining_sensor:
+      name: "Forecast.Solar: Restprognose heute"
+      description: >
+        Der Forecast.Solar-Sensor "Energieerzeugung heute - Rest"
+        (sensor.energy_production_today_remaining), Einheit kWh
+      selector:
+        entity:
+          domain: sensor
+
+    pv_peak_time_today_sensor:
+      name: "Forecast.Solar: Ertrags-Peak heute"
+      description: >
+        Forecast.Solar-Sensor "Höchster Peak-Zeitpunkt heute"
+        (sensor.power_highest_peak_time_today)
+      selector:
+        entity:
+          domain: sensor
+
+    pv_peak_time_tomorrow_sensor:
+      name: "Forecast.Solar: Ertrags-Peak morgen"
+      description: >
+        Forecast.Solar-Sensor "Höchster Peak-Zeitpunkt morgen"
+        (sensor.power_highest_peak_time_tomorrow). Wird nur für die Warnmeldung
+        genutzt, falls auch die heutige Prognose nicht ausreicht.
+      selector:
+        entity:
+          domain: sensor
+
+    notify_service:
+      name: Notify-Service
+      description: >
+        Vollständige Service-ID für die Benachrichtigung, z.B.
+        notify.mobile_app_dein_handy
+      selector:
+        text: {}
+
+    check_interval_minutes:
+      name: Prüfintervall (Minuten)
+      description: Wie oft die Bedingungen periodisch geprüft werden
+      default: 15
+      selector:
+        number:
+          min: 5
+          max: 60
+          step: 5
+          unit_of_measurement: "min"
+          mode: box
+
+mode: single
+
+variables:
+  appliance_name: !input appliance_name
+  appliance_switch: !input appliance_switch
+  appliance_ready_helper: !input appliance_ready_helper
+  appliance_energy_wh: !input appliance_energy_wh
+  battery_soc_sensor: !input battery_soc_sensor
+  battery_capacity_wh: !input battery_capacity_wh
+  battery_reserve_soc: !input battery_reserve_soc
+  grid_power_sensor: !input grid_power_sensor
+  grid_import_is_positive: !input grid_import_is_positive
+  pv_forecast_remaining_sensor: !input pv_forecast_remaining_sensor
+  pv_peak_time_today_sensor: !input pv_peak_time_today_sensor
+  pv_peak_time_tomorrow_sensor: !input pv_peak_time_tomorrow_sensor
+  notify_service: !input notify_service
+
+triggers:
+  - trigger: time_pattern
+    minutes: !input check_interval_minutes
+    id: periodisch
+  - trigger: state
+    entity_id: !input appliance_ready_helper
+    to: "on"
+    id: sofortpruefung
+
+conditions:
+  - condition: state
+    entity_id: !input appliance_ready_helper
+    state: "on"
+  - condition: state
+    entity_id: !input appliance_switch
+    state: "off"
+
+actions:
+  - variables:
+      soc: "{{ states(battery_soc_sensor) | float(0) }}"
+      grid_power: "{{ states(grid_power_sensor) | float(0) }}"
+      surplus_w: >
+        {{ (grid_power * -1) if grid_import_is_positive else grid_power }}
+      available_battery_wh: >
+        {{ [((soc - battery_reserve_soc) / 100 * battery_capacity_wh), 0] | max }}
+      forecast_remaining_wh: >
+        {{ (states(pv_forecast_remaining_sensor) | float(0)) * 1000 }}
+      total_available_wh: "{{ available_battery_wh + forecast_remaining_wh }}"
+      can_start_now: >
+        {{ surplus_w >= 0 and available_battery_wh >= appliance_energy_wh }}
+      day_will_be_enough: "{{ total_available_wh >= appliance_energy_wh }}"
+      recently_notified: >
+        {{ this.attributes.last_triggered is not none and
+           (as_timestamp(now()) - as_timestamp(this.attributes.last_triggered)) < 3600 }}
+
+  - choose:
+      # Fall 1: Jetzt genug Energie ohne Netzbezug -> einschalten
+      - conditions: "{{ can_start_now }}"
+        sequence:
+          - action: switch.turn_on
+            target:
+              entity_id: "{{ appliance_switch }}"
+          - action: notify.send_message
+            target:
+              entity_id: "{{ notify_service }}"
+            data:
+              message: >
+                {{ appliance_name }} wurde gestartet - genug PV-Überschuss
+                bzw. Akkureserve vorhanden, kein Netzbezug erwartet.
+
+      # Fall 2: Jetzt nicht genug, aber im Tagesverlauf ausreichend -> Vorschlag
+      - conditions: "{{ not can_start_now and day_will_be_enough and not recently_notified }}"
+        sequence:
+          - action: notify.send_message
+            target:
+              entity_id: "{{ notify_service }}"
+            data:
+              message: >
+                {{ appliance_name }} kann aktuell nicht ohne Netzbezug gestartet
+                werden. Laut Prognose reicht die Energie aber im Tagesverlauf.
+                Empfohlener Zeitpunkt (PV-Peak heute):
+                {{ as_timestamp(states(pv_peak_time_today_sensor)) | timestamp_custom('%H:%M') if states(pv_peak_time_today_sensor) not in ['unknown','unavailable'] else 'siehe Forecast.Solar' }} Uhr.
+
+      # Fall 3: Auch Tagesprognose reicht nicht -> Warnung, Netzbezug nötig
+      - conditions: "{{ not can_start_now and not day_will_be_enough and not recently_notified }}"
+        sequence:
+          - action: notify.send_message
+            target:
+              entity_id: "{{ notify_service }}"
+            data:
+              message: >
+                Für {{ appliance_name }} reicht die heutige PV-Prognose und
+                Akkureserve voraussichtlich nicht aus - Netzbezug wird nötig sein.
+                Nächster PV-Peak morgen:
+                {{ as_timestamp(states(pv_peak_time_tomorrow_sensor)) | timestamp_custom('%H:%M') if states(pv_peak_time_tomorrow_sensor) not in ['unknown','unavailable'] else 'siehe Forecast.Solar' }} Uhr,
+                oder jetzt manuell mit Netzbezug starten.
