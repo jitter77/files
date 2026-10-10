@@ -1,0 +1,387 @@
+blueprint:
+  name: PV-Überschuss Verbraucher-Automatik mit Zigbee-Taster (SMA + Forecast.Solar + Smart-Plug)
+  description: >
+    Schaltet einen Verbraucher (z.B. Waschmaschine, Spülmaschine, Trockner) über
+    einen Smart-Plug/Relais ein, sobald genug PV-Überschuss bzw. Akkukapazität
+    vorhanden ist, um ihn ohne Netzbezug zu betreiben.
+
+    Die Startbereitschaft meldest du über einen Zigbee-Taster/-Schalter am
+    Gerät (frei wählbar, z.B. Aqara, IKEA, Sonoff). Je nach Einstellung
+    "Taster-Modus" schaltet jeder Tastendruck die Bereitschaft um (Taster)
+    oder die Bereitschaft folgt dem Ein/Aus-Zustand des Schalters.
+
+    Reicht die Energie nicht aus, schickt Home Assistant eine Benachrichtigung
+    mit zwei Buttons (nur Companion App):
+    1. "Trotzdem jetzt starten" -> schaltet den Verbraucher sofort ein, auch
+       mit Netzbezug.
+    2. "Automatisch später starten" -> die Automation überwacht weiter still
+       im Hintergrund und schaltet automatisch ein, sobald am selben Tag
+       genug PV-Überschuss/Akkuladung verfügbar ist.
+
+    Voraussetzung: Zwei input_boolean-Helfer pro Gerät (Bereitschaft und
+    "wartet auf PV"). Beide werden von der Automation selbst verwaltet, du
+    musst sie nur einmal anlegen.
+  domain: automation
+  source_url: https://www.home-assistant.io/
+  input:
+    appliance_name:
+      name: Gerätename
+      description: Freitext-Name für Benachrichtigungen, z.B. "Waschmaschine"
+      selector:
+        text: {}
+
+    appliance_switch:
+      name: Smart-Plug / Relais des Geräts
+      description: Der Schalter, über den das Gerät eingeschaltet wird
+      selector:
+        entity:
+          domain: switch
+
+    ready_button:
+      name: Zigbee-Taster / -Schalter (Bereitschaft)
+      description: >
+        Die Entität deines Zigbee-Tasters. Je nach Integration ist das:
+        - ein event-Entity (z.B. event.waschmaschine_taster_action, bei ZHA
+          und Zigbee2MQTT in aktuellen HA-Versionen), oder
+        - ein sensor mit der letzten Aktion (z.B. sensor.taster_action,
+          Zigbee2MQTT), oder
+        - ein binary_sensor/switch mit festem Ein/Aus-Zustand.
+        Jede Zustandsänderung dieser Entität zählt als Tastendruck.
+      selector:
+        entity:
+          domain:
+            - event
+            - sensor
+            - binary_sensor
+            - switch
+
+    button_mode:
+      name: Taster-Modus
+      description: >
+        "Taster (umschalten)": Jeder Tastendruck schaltet die Bereitschaft
+        ein bzw. wieder aus. "Schalter (Zustand übernehmen)": Die Bereitschaft
+        folgt dem Zustand der gewählten Entität (an = bereit, aus = nicht
+        bereit). Der zweite Modus passt nur für Entitäten mit festem
+        on/off-Zustand.
+      default: toggle
+      selector:
+        select:
+          options:
+            - label: "Taster (jeder Druck schaltet um)"
+              value: toggle
+            - label: "Schalter (Zustand übernehmen)"
+              value: state
+
+    appliance_ready_helper:
+      name: "Bereitschafts-Helfer (input_boolean)"
+      description: >
+        Interner Merker, wird vom Taster gesetzt. Lege vorher unter
+        Einstellungen -> Geräte & Dienste -> Helfer einen "Ein/Aus"-Schalter
+        an, z.B. input_boolean.waschmaschine_bereit. Wird nach dem Start des
+        Geräts automatisch zurückgesetzt.
+      selector:
+        entity:
+          domain: input_boolean
+
+    auto_start_pending_helper:
+      name: "Helfer: Automatischer Start später gewünscht (input_boolean)"
+      description: >
+        Ein zweiter, separater input_boolean-Helfer, z.B.
+        input_boolean.waschmaschine_wartet_auf_pv. Wird von der Automation
+        selbst gesetzt/zurückgesetzt.
+      selector:
+        entity:
+          domain: input_boolean
+
+    appliance_energy_wh:
+      name: Geschätzter Energiebedarf (Wh)
+      description: Ungefährer Stromverbrauch eines Programmlaufs in Wattstunden
+      default: 1000
+      selector:
+        number:
+          min: 100
+          max: 10000
+          step: 50
+          unit_of_measurement: "Wh"
+          mode: box
+
+    battery_soc_sensor:
+      name: Akku-Ladestand-Sensor (SoC)
+      selector:
+        entity:
+          domain: sensor
+          device_class: battery
+
+    battery_capacity_wh:
+      name: Akku-Gesamtkapazität (Wh)
+      selector:
+        number:
+          min: 500
+          max: 50000
+          step: 100
+          unit_of_measurement: "Wh"
+          mode: box
+
+    battery_reserve_soc:
+      name: Akku-Reserve (%)
+      description: Ladestand, der als Mindestreserve immer im Akku bleiben soll
+      default: 20
+      selector:
+        number:
+          min: 0
+          max: 90
+          step: 5
+          unit_of_measurement: "%"
+          mode: slider
+
+    grid_power_sensor:
+      name: Netzbezug/-einspeisung-Sensor (SMA)
+      selector:
+        entity:
+          domain: sensor
+
+    grid_import_is_positive:
+      name: Netzbezug ist positiver Wert
+      description: >
+        Aktivieren, wenn dein Sensor bei Netzbezug einen positiven Wert und
+        bei Einspeisung/Überschuss einen negativen Wert liefert (typisch für
+        viele SMA-Sensoren). Deaktivieren, falls es umgekehrt ist.
+      default: true
+      selector:
+        boolean: {}
+
+    pv_forecast_remaining_sensor:
+      name: "Forecast.Solar: Restprognose heute"
+      description: sensor.energy_production_today_remaining (kWh)
+      selector:
+        entity:
+          domain: sensor
+
+    notify_device:
+      name: Benachrichtigungs-Gerät (Companion App)
+      description: >
+        Wähle hier das Handy/Tablet aus, das die Benachrichtigung mit den
+        Aktions-Buttons erhalten soll. Zur Auswahl stehen alle Geräte, auf
+        denen die Home-Assistant-Companion-App eingerichtet ist.
+      selector:
+        device:
+          integration: mobile_app
+
+    check_interval_minutes:
+      name: Prüfintervall (Minuten)
+      default: 15
+      selector:
+        number:
+          min: 5
+          max: 60
+          step: 5
+          unit_of_measurement: "min"
+          mode: box
+
+# queued, damit Zustandsänderungen der Helfer, die diese Automation selbst
+# auslöst, nicht verworfen werden
+mode: queued
+max: 10
+
+variables:
+  appliance_name: !input appliance_name
+  appliance_switch: !input appliance_switch
+  ready_button: !input ready_button
+  button_mode: !input button_mode
+  appliance_ready_helper: !input appliance_ready_helper
+  auto_start_pending_helper: !input auto_start_pending_helper
+  appliance_energy_wh: !input appliance_energy_wh
+  battery_soc_sensor: !input battery_soc_sensor
+  battery_capacity_wh: !input battery_capacity_wh
+  battery_reserve_soc: !input battery_reserve_soc
+  grid_power_sensor: !input grid_power_sensor
+  grid_import_is_positive: !input grid_import_is_positive
+  pv_forecast_remaining_sensor: !input pv_forecast_remaining_sensor
+  notify_device: !input notify_device
+  # Notify-Service aus dem Gerätenamen ableiten: notify.mobile_app_<gerätename>
+  notify_action: "notify.mobile_app_{{ device_attr(notify_device, 'name') | slugify }}"
+  action_start_now: "START_NOW_{{ appliance_switch }}"
+  action_start_later: "START_LATER_{{ appliance_switch }}"
+
+triggers:
+  - trigger: time_pattern
+    minutes: !input check_interval_minutes
+    id: periodisch
+  # Zigbee-Taster / -Schalter: jede echte Zustandsänderung zählt
+  - trigger: state
+    entity_id: !input ready_button
+    not_from:
+      - unavailable
+      - unknown
+    not_to:
+      - unavailable
+      - unknown
+    id: taster
+  - trigger: state
+    entity_id: !input appliance_ready_helper
+    to: "on"
+    id: sofortpruefung
+  - trigger: state
+    entity_id: !input appliance_ready_helper
+    to: "off"
+    id: geraet_nicht_mehr_bereit
+  - trigger: event
+    event_type: mobile_app_notification_action
+    id: notification_antwort
+
+actions:
+  - choose:
+      # -----------------------------------------------------------------
+      # T) Zigbee-Taster wurde betätigt -> Bereitschafts-Helfer setzen
+      # -----------------------------------------------------------------
+      - conditions:
+          - condition: trigger
+            id: taster
+        sequence:
+          - choose:
+              # T1) Taster-Modus: jeder Druck schaltet um
+              - conditions: "{{ button_mode == 'toggle' }}"
+                sequence:
+                  - action: input_boolean.toggle
+                    target:
+                      entity_id: "{{ appliance_ready_helper }}"
+              # T2) Schalter-Modus: Zustand der Entität übernehmen
+              - conditions: "{{ button_mode == 'state' and trigger.to_state.state == 'on' }}"
+                sequence:
+                  - action: input_boolean.turn_on
+                    target:
+                      entity_id: "{{ appliance_ready_helper }}"
+              - conditions: "{{ button_mode == 'state' and trigger.to_state.state == 'off' }}"
+                sequence:
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id: "{{ appliance_ready_helper }}"
+
+      # -----------------------------------------------------------------
+      # A) Bereitschaft wurde zurückgenommen (Helfer aus) -> Wartemerker
+      #    zurücksetzen, keine weitere Aktion
+      # -----------------------------------------------------------------
+      - conditions:
+          - condition: trigger
+            id: geraet_nicht_mehr_bereit
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ auto_start_pending_helper }}"
+
+      # -----------------------------------------------------------------
+      # B) Reaktion auf Benachrichtigungs-Button
+      # -----------------------------------------------------------------
+      - conditions:
+          - condition: trigger
+            id: notification_antwort
+        sequence:
+          - choose:
+              # B1) "Trotzdem jetzt starten"
+              - conditions: "{{ trigger.event.data.action == action_start_now }}"
+                sequence:
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ appliance_switch }}"
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id:
+                        - "{{ auto_start_pending_helper }}"
+                        - "{{ appliance_ready_helper }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ appliance_name }} wird jetzt gestartet
+                        (manuell bestätigt, ggf. mit Netzbezug).
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+
+              # B2) "Automatisch später starten"
+              - conditions: "{{ trigger.event.data.action == action_start_later }}"
+                sequence:
+                  - action: input_boolean.turn_on
+                    target:
+                      entity_id: "{{ auto_start_pending_helper }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        Alles klar, {{ appliance_name }} wird automatisch
+                        gestartet, sobald heute genug Solarüberschuss oder
+                        Akkuladung verfügbar ist.
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+
+      # -----------------------------------------------------------------
+      # C) Regulärer Check (periodisch oder direkt nach Bereitschaftsmeldung)
+      # -----------------------------------------------------------------
+      - conditions:
+          - condition: trigger
+            id: ["periodisch", "sofortpruefung"]
+          - condition: state
+            entity_id: !input appliance_ready_helper
+            state: "on"
+          - condition: state
+            entity_id: !input appliance_switch
+            state: "off"
+        sequence:
+          - variables:
+              soc: "{{ states(battery_soc_sensor) | float(0) }}"
+              grid_power: "{{ states(grid_power_sensor) | float(0) }}"
+              surplus_w: >
+                {{ (grid_power * -1) if grid_import_is_positive else grid_power }}
+              available_battery_wh: >
+                {{ [((soc - battery_reserve_soc) / 100 * battery_capacity_wh), 0] | max }}
+              forecast_remaining_wh: >
+                {{ (states(pv_forecast_remaining_sensor) | float(0)) * 1000 }}
+              total_available_wh: "{{ available_battery_wh + forecast_remaining_wh }}"
+              can_start_now: >
+                {{ surplus_w >= 0 and available_battery_wh >= appliance_energy_wh }}
+              day_will_be_enough: "{{ total_available_wh >= appliance_energy_wh }}"
+              already_waiting: "{{ is_state(auto_start_pending_helper, 'on') }}"
+              recently_notified: >
+                {{ this.attributes.last_triggered is not none and
+                   (as_timestamp(now()) - as_timestamp(this.attributes.last_triggered)) < 3600 }}
+
+          - choose:
+              # C1) Jetzt genug Energie -> einschalten (egal ob vorher Rückfrage lief)
+              - conditions: "{{ can_start_now }}"
+                sequence:
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ appliance_switch }}"
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id:
+                        - "{{ auto_start_pending_helper }}"
+                        - "{{ appliance_ready_helper }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ appliance_name }} wurde automatisch gestartet -
+                        genug PV-Überschuss bzw. Akkureserve vorhanden,
+                        kein Netzbezug erwartet.
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+
+              # C2) Nutzer hat "automatisch später starten" bereits bestätigt
+              #     -> still weiter warten, nicht erneut fragen
+              - conditions: "{{ not can_start_now and already_waiting }}"
+                sequence: []
+
+              # C3) Noch keine Entscheidung getroffen -> Rückfrage schicken
+              - conditions: "{{ not can_start_now and not already_waiting and not recently_notified }}"
+                sequence:
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ appliance_name }} ist startbereit, aktuell reicht
+                        der Solarüberschuss/die Akkureserve aber nicht aus
+                        {{ '(laut Prognose reicht es im Tagesverlauf)' if day_will_be_enough else '(auch die Tagesprognose reicht voraussichtlich nicht)' }}.
+                        Was soll passieren?
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+                        actions:
+                          - action: "{{ action_start_now }}"
+                            title: "Trotzdem jetzt starten"
+                          - action: "{{ action_start_later }}"
+                            title: "Automatisch später starten"
