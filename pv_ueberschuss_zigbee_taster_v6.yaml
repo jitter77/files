@@ -1,0 +1,453 @@
+blueprint:
+  name: PV-Überschuss Verbraucher-Automatik per Zigbee-Taster mit Alexa-Ansage (SMA + Forecast.Solar)
+  description: >
+    Ein Tastendruck am Gerät meldet: "Gerät ist beladen und bereit zum Betrieb".
+    Das Relais wird dabei eingeschaltet und bleibt eingeschaltet, damit du am
+    Gerät das Programm wählen kannst. Danach prüft die Automation, ob der
+    Verbraucher (z.B. Waschmaschine, Spülmaschine, Trockner) ohne Netzbezug
+    laufen kann.
+
+    - Einfacher Tastendruck + genug Akkuladung/PV-Überschuss -> Relais bleibt
+      an, das Gerät startet sofort. Ansage: "<Gerät> startet".
+    - Einfacher Tastendruck + zu wenig Energie -> Frage per Alexa-Ansage und
+      Push-Benachrichtigung mit zwei Buttons (Antwort per Handy):
+      1. "Trotzdem jetzt starten" -> Relais bleibt an, Ansage "<Gerät> startet".
+      2. "Bei ausreichender Energie starten" -> Relais wird ausgeschaltet,
+         Ansage "<Gerät> startet bei ausreichender Energie". Sobald genug
+         Energie verfügbar ist (auch erst am nächsten Tag), wird das Relais
+         wieder eingeschaltet und "<Gerät> startet" angesagt.
+    - Langer Tastendruck (Aktion "long") -> Relais an, Gerät startet sofort,
+      auch mit Netzbezug.
+    - Alle anderen Aktionen (z.B. Doppelklick) werden ignoriert.
+
+    Der Smart Speaker ist optional. Ohne Auswahl gibt es nur Push-Meldungen.
+    Voraussetzung für die Ansage: Integration "Alexa Media Player" (HACS).
+    Alexa kann in Home Assistant keine gesprochene Antwort zurückgeben, deshalb
+    wird die Frage vorgelesen und per Handy beantwortet.
+
+    Außerdem wird ein input_boolean-Helfer pro Gerät benötigt, der sich merkt,
+    dass ein späterer automatischer Start gewünscht ist. Er wird von der
+    Automation selbst verwaltet, du musst ihn nur einmal anlegen.
+  domain: automation
+  source_url: https://www.home-assistant.io/
+  input:
+    appliance_name:
+      name: Gerätename
+      description: Freitext-Name für Ansagen und Benachrichtigungen, z.B. "Spülmaschine"
+      selector:
+        text: {}
+
+    appliance_switch:
+      name: Relais / Smart-Plug des Geräts
+      description: >
+        Der Schalter, der das Gerät mit Strom versorgt. Er wird beim
+        Tastendruck eingeschaltet und bleibt an, damit du das Programm am
+        Gerät wählen kannst.
+      selector:
+        entity:
+          domain: switch
+
+    ready_button:
+      name: Zigbee-Taster (meldet Bereitschaft)
+      description: >
+        Die Entität deines Zigbee-Tasters. Ein Druck bedeutet: Gerät ist
+        beladen und bereit zum Betrieb. Bei Zigbee2MQTT meist eine
+        event-Entität (z.B. event.spuelmaschine_taster_action) oder ein sensor
+        mit der letzten Aktion. Bei event-Entitäten wird der Wert aus dem
+        Attribut event_type gelesen, sonst der Zustand der Entität.
+      selector:
+        entity:
+          domain:
+            - event
+            - sensor
+            - binary_sensor
+            - switch
+
+    button_short_value:
+      name: "Aktion für einfachen Tastendruck"
+      description: >
+        Beim SONOFF SNZB-01P (Zigbee2MQTT) ist das "single".
+      default: single
+      selector:
+        text: {}
+
+    button_long_value:
+      name: "Aktion für langen Tastendruck"
+      description: >
+        Beim SONOFF SNZB-01P (Zigbee2MQTT) ist das "long". Ein langer Druck
+        startet das Gerät sofort, auch mit Netzbezug.
+      default: long
+      selector:
+        text: {}
+
+    speaker_entity:
+      name: "Smart Speaker für Ansagen (optional)"
+      description: >
+        Alexa-Gerät, das die Frage und die Bestätigung ansagt. Leer lassen,
+        wenn nur Push-Meldungen gewünscht sind. Es werden Geräte der
+        Integration "Alexa Media Player" (HACS) angezeigt.
+      default: ""
+      selector:
+        entity:
+          domain: media_player
+          integration: alexa_media
+
+    auto_start_pending_helper:
+      name: "Helfer: Automatischer Start später gewünscht (input_boolean)"
+      description: >
+        Lege vorher unter Einstellungen -> Geräte & Dienste -> Helfer einen
+        "Ein/Aus"-Schalter an, z.B. input_boolean.spuelmaschine_wartet_auf_pv.
+        Wird von der Automation selbst gesetzt/zurückgesetzt. Du kannst ihn
+        auch von Hand ausschalten, um eine Vormerkung abzubrechen.
+      selector:
+        entity:
+          domain: input_boolean
+
+    appliance_energy_wh:
+      name: Geschätzter Energiebedarf (Wh)
+      description: Ungefährer Stromverbrauch eines Programmlaufs in Wattstunden
+      default: 1000
+      selector:
+        number:
+          min: 100
+          max: 10000
+          step: 50
+          unit_of_measurement: "Wh"
+          mode: box
+
+    battery_soc_sensor:
+      name: Akku-Ladestand-Sensor (SoC)
+      selector:
+        entity:
+          domain: sensor
+          device_class: battery
+
+    battery_capacity_wh:
+      name: Akku-Gesamtkapazität (Wh)
+      selector:
+        number:
+          min: 500
+          max: 50000
+          step: 100
+          unit_of_measurement: "Wh"
+          mode: box
+
+    battery_reserve_soc:
+      name: Akku-Reserve (%)
+      description: Ladestand, der als Mindestreserve immer im Akku bleiben soll
+      default: 20
+      selector:
+        number:
+          min: 0
+          max: 90
+          step: 5
+          unit_of_measurement: "%"
+          mode: slider
+
+    grid_power_sensor:
+      name: Netzbezug/-einspeisung-Sensor (SMA)
+      selector:
+        entity:
+          domain: sensor
+
+    grid_import_is_positive:
+      name: Netzbezug ist positiver Wert
+      description: >
+        Aktivieren, wenn dein Sensor bei Netzbezug einen positiven Wert und
+        bei Einspeisung/Überschuss einen negativen Wert liefert (typisch für
+        viele SMA-Sensoren). Deaktivieren, falls es umgekehrt ist.
+      default: true
+      selector:
+        boolean: {}
+
+    pv_forecast_remaining_sensor:
+      name: "Forecast.Solar: Restprognose heute"
+      description: sensor.energy_production_today_remaining (kWh)
+      selector:
+        entity:
+          domain: sensor
+
+    notify_device:
+      name: Benachrichtigungs-Gerät (Companion App)
+      description: >
+        Handy/Tablet, das die Benachrichtigung mit den Aktions-Buttons
+        erhält. Zur Auswahl stehen alle Geräte mit Home-Assistant-Companion-App.
+      selector:
+        device:
+          integration: mobile_app
+
+    check_interval_minutes:
+      name: Prüfintervall (Minuten)
+      description: >
+        Wie oft im Hintergrund geprüft wird, ob genug Energie für den
+        vorgemerkten späteren Start da ist.
+      default: 15
+      selector:
+        number:
+          min: 5
+          max: 60
+          step: 5
+          unit_of_measurement: "min"
+          mode: box
+
+# queued, damit Tastendruck, Button-Antwort und periodische Prüfung sich nicht
+# gegenseitig verwerfen
+mode: queued
+max: 10
+
+variables:
+  appliance_name: !input appliance_name
+  appliance_switch: !input appliance_switch
+  button_short_value: !input button_short_value
+  button_long_value: !input button_long_value
+  speaker_entity: !input speaker_entity
+  speaker_enabled: "{{ speaker_entity | string | length > 0 }}"
+  auto_start_pending_helper: !input auto_start_pending_helper
+  appliance_energy_wh: !input appliance_energy_wh
+  battery_soc_sensor: !input battery_soc_sensor
+  battery_capacity_wh: !input battery_capacity_wh
+  battery_reserve_soc: !input battery_reserve_soc
+  grid_power_sensor: !input grid_power_sensor
+  grid_import_is_positive: !input grid_import_is_positive
+  pv_forecast_remaining_sensor: !input pv_forecast_remaining_sensor
+  notify_device: !input notify_device
+  # Notify-Service aus dem Gerätenamen ableiten: notify.mobile_app_<gerätename>
+  notify_action: "notify.mobile_app_{{ device_attr(notify_device, 'name') | slugify }}"
+  action_start_now: "START_NOW_{{ appliance_switch }}"
+  action_start_later: "START_LATER_{{ appliance_switch }}"
+
+triggers:
+  # Physischer Taster = Gerät ist bereit (einfacher oder langer Druck)
+  - trigger: state
+    entity_id: !input ready_button
+    not_from:
+      - unavailable
+    not_to:
+      - unavailable
+      - unknown
+    id: taster
+  # Hintergrundprüfung für den vorgemerkten späteren Start
+  - trigger: time_pattern
+    minutes: !input check_interval_minutes
+    id: periodisch
+  # Antwort auf die Benachrichtigungs-Buttons
+  - trigger: event
+    event_type: mobile_app_notification_action
+    id: notification_antwort
+
+actions:
+  - variables:
+      soc: "{{ states(battery_soc_sensor) | float(0) }}"
+      grid_power: "{{ states(grid_power_sensor) | float(0) }}"
+      surplus_w: >
+        {{ (grid_power * -1) if grid_import_is_positive else grid_power }}
+      available_battery_wh: >
+        {{ [((soc - battery_reserve_soc) / 100 * battery_capacity_wh), 0] | max }}
+      forecast_remaining_wh: >
+        {{ (states(pv_forecast_remaining_sensor) | float(0)) * 1000 }}
+      total_available_wh: "{{ available_battery_wh + forecast_remaining_wh }}"
+      can_start_now: >
+        {{ surplus_w >= 0 and available_battery_wh >= appliance_energy_wh }}
+      day_will_be_enough: "{{ total_available_wh >= appliance_energy_wh }}"
+      # Wert des Tasters: bei event-Entitäten das Attribut event_type, sonst der Zustand
+      button_value: >
+        {{ (trigger.to_state.attributes.get('event_type', trigger.to_state.state)
+            if trigger.id == 'taster' else '') | string }}
+
+  - choose:
+      # -----------------------------------------------------------------
+      # T) Taster gedrückt: einfacher oder langer Druck -> Gerät ist bereit.
+      #    Das Relais wird eingeschaltet, damit das Programm am Gerät
+      #    gewählt werden kann. Andere Aktionen (z.B. Doppelklick) werden
+      #    ignoriert.
+      # -----------------------------------------------------------------
+      - conditions:
+          - condition: trigger
+            id: taster
+          - condition: template
+            value_template: >
+              {{ button_value in [button_short_value, button_long_value]
+                 and button_value not in ['', 'none', 'unknown', 'unavailable'] }}
+        sequence:
+          - variables:
+              long_press: "{{ button_value == button_long_value }}"
+          # Eine frühere Vormerkung gilt nicht mehr, es wird neu entschieden
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ auto_start_pending_helper }}"
+          # Relais an, damit das Programm gewählt werden kann
+          - action: switch.turn_on
+            target:
+              entity_id: "{{ appliance_switch }}"
+          - choose:
+              # T1) Langer Druck -> sofort starten, auch mit Netzbezug
+              - conditions: "{{ long_press }}"
+                sequence:
+                  - if: "{{ speaker_enabled }}"
+                    then:
+                      - action: notify.alexa_media
+                        data:
+                          message: "{{ appliance_name }} startet"
+                          data:
+                            type: announce
+                          target: "{{ speaker_entity }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ appliance_name }} startet per langem Tastendruck
+                        sofort. Netzbezug wird dabei in Kauf genommen.
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+              # T2) Einfacher Druck + genug Energie -> Relais bleibt an
+              - conditions: "{{ can_start_now }}"
+                sequence:
+                  - if: "{{ speaker_enabled }}"
+                    then:
+                      - action: notify.alexa_media
+                        data:
+                          message: "{{ appliance_name }} startet"
+                          data:
+                            type: announce
+                          target: "{{ speaker_entity }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ appliance_name }} startet - genug PV-Überschuss
+                        bzw. Akkureserve vorhanden, kein Netzbezug erwartet.
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+            # T3) Einfacher Druck + zu wenig Energie -> Frage per Speaker + Handy
+            default:
+              - if: "{{ speaker_enabled }}"
+                then:
+                  - action: notify.alexa_media
+                    data:
+                      message: >
+                        {{ appliance_name }}: Aktuell reicht die Energie nicht
+                        aus. Bitte am Handy wählen, ob das Gerät sofort
+                        starten soll oder bei ausreichender Energie.
+                      data:
+                        type: announce
+                      target: "{{ speaker_entity }}"
+              - action: "{{ notify_action }}"
+                data:
+                  message: >
+                    {{ appliance_name }} ist bereit, aktuell reicht der
+                    Solarüberschuss/die Akkureserve aber nicht aus
+                    {{ '(laut Prognose reicht es im Tagesverlauf)' if day_will_be_enough else '(auch die Tagesprognose reicht voraussichtlich nicht)' }}.
+                    Soll das Gerät sofort starten oder bei ausreichender Energie?
+                  data:
+                    tag: "pv_start_{{ appliance_switch }}"
+                    actions:
+                      - action: "{{ action_start_now }}"
+                        title: "Sofort starten"
+                      - action: "{{ action_start_later }}"
+                        title: "Bei ausreichender Energie starten"
+
+      # -----------------------------------------------------------------
+      # B) Antwort auf einen Benachrichtigungs-Button
+      # -----------------------------------------------------------------
+      - conditions:
+          - condition: trigger
+            id: notification_antwort
+        sequence:
+          - choose:
+              # B1) "Sofort starten" -> Relais bleibt an
+              - conditions: "{{ trigger.event.data.action == action_start_now }}"
+                sequence:
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ appliance_switch }}"
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id: "{{ auto_start_pending_helper }}"
+                  - if: "{{ speaker_enabled }}"
+                    then:
+                      - action: notify.alexa_media
+                        data:
+                          message: "{{ appliance_name }} startet"
+                          data:
+                            type: announce
+                          target: "{{ speaker_entity }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ appliance_name }} startet jetzt
+                        (bestätigt, ggf. mit Netzbezug).
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+
+              # B2) "Bei ausreichender Energie starten" -> Relais aus, vormerken
+              - conditions: "{{ trigger.event.data.action == action_start_later }}"
+                sequence:
+                  - action: input_boolean.turn_on
+                    target:
+                      entity_id: "{{ auto_start_pending_helper }}"
+                  - action: switch.turn_off
+                    target:
+                      entity_id: "{{ appliance_switch }}"
+                  - if: "{{ speaker_enabled }}"
+                    then:
+                      - action: notify.alexa_media
+                        data:
+                          message: "{{ appliance_name }} startet bei ausreichender Energie"
+                          data:
+                            type: announce
+                          target: "{{ speaker_entity }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ appliance_name }} startet bei ausreichender Energie.
+                        Das Relais ist jetzt aus und wird eingeschaltet, sobald
+                        genug Solarüberschuss oder Akkuladung verfügbar ist,
+                        notfalls auch erst morgen. Zum sofortigen Start den
+                        Taster lang drücken.
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+
+      # -----------------------------------------------------------------
+      # P) Hintergrundprüfung: vorgemerkter späterer Start. Die Vormerkung
+      #    bleibt bestehen, bis das Gerät läuft (auch über Nacht).
+      # -----------------------------------------------------------------
+      - conditions:
+          - condition: trigger
+            id: periodisch
+          - condition: state
+            entity_id: !input auto_start_pending_helper
+            state: "on"
+        sequence:
+          - choose:
+              # P1) Relais wurde zwischenzeitlich anders eingeschaltet -> Vormerkung löschen
+              - conditions:
+                  - condition: state
+                    entity_id: !input appliance_switch
+                    state: "on"
+                sequence:
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id: "{{ auto_start_pending_helper }}"
+              # P2) Jetzt genug Energie -> Relais einschalten, Gerät startet
+              - conditions: "{{ can_start_now }}"
+                sequence:
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ appliance_switch }}"
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id: "{{ auto_start_pending_helper }}"
+                  - if: "{{ speaker_enabled }}"
+                    then:
+                      - action: notify.alexa_media
+                        data:
+                          message: "{{ appliance_name }} startet"
+                          data:
+                            type: announce
+                          target: "{{ speaker_entity }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ appliance_name }} startet jetzt - genug
+                        PV-Überschuss bzw. Akkureserve vorhanden,
+                        kein Netzbezug erwartet.
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
