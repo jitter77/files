@@ -1,0 +1,1122 @@
+blueprint:
+  name: PV-Überschuss Verbraucher-Automatik per Zigbee-Taster (v11)
+  description: >
+    Ein Tastendruck am Gerät meldet: "Gerät ist beladen und bereit". Das Relais
+    wird eingeschaltet (Programmwahl am Gerät möglich). Danach entscheidet die
+    Automation anhand von Akku, PV-Prognose und Haushaltsverbrauch, ob das Gerät
+    ohne Netzbezug laufen kann.
+
+    - Einfacher Druck + genug Energie -> Gerät startet sofort ("<Gerät> startet").
+    - Einfacher Druck + zu wenig Energie -> Frage per Alexa und Push mit bis zu
+      drei Buttons: "Sofort starten", "Bei ausreichender Energie starten",
+      "Zur PV-Spitze (heute/morgen HH:MM)". Ohne Antwort wird nach einer
+      einstellbaren Zeit die Standardauswahl ausgeführt.
+    - Langer Druck -> sofortiger Start, auch mit Netzbezug.
+
+    Zusätzlich: Fertig-Erkennung über einen Laufsensor (z.B. WashData) oder den
+    Leistungssensor des Steckers mit Ansage, Lernen des echten Verbrauchs pro Durchlauf, Schutz vor ausgefallenen
+    Sensoren, Prüfung der maximalen Entladeleistung des Akkus, Zeitfenster für
+    automatische Starts (keine Starts in der Nacht), späteste Startzeit bei
+    "Bei ausreichender Energie" und eine Gerätesperre, damit mehrere Geräte mit
+    diesem Blueprint nicht gleichzeitig laufen.
+
+    Benötigte Helfer pro Gerät: input_boolean (wartet auf Start), input_datetime
+    mit Datum und Uhrzeit (geplanter Start). Optional: input_number (gelernter
+    Verbrauch) und ein input_text (Laufstatus/Gerätesperre, bei mehreren Geräten
+    für alle derselbe).
+  domain: automation
+  source_url: https://www.home-assistant.io/
+  input:
+    device_section:
+      name: Gerät und Taster
+      icon: mdi:dishwasher
+      input:
+        appliance_name:
+          name: Gerätename
+          description: Für Ansagen und Benachrichtigungen, z.B. "Spülmaschine".
+          selector:
+            text: {}
+        appliance_switch:
+          name: Relais / Smart-Plug des Geräts
+          description: >
+            Versorgt das Gerät mit Strom. Wird beim Tastendruck eingeschaltet,
+            damit das Programm gewählt werden kann. Ist das Relais an, läuft das
+            gewählte Programm los.
+          selector:
+            entity:
+              domain: switch
+        ready_button:
+          name: Zigbee-Taster (meldet Bereitschaft)
+          description: >
+            Event-Entität oder Aktions-Sensor des Tasters (Zigbee2MQTT). Bei
+            event-Entitäten wird das Attribut event_type gelesen.
+          selector:
+            entity:
+              domain:
+                - event
+                - sensor
+                - binary_sensor
+                - switch
+        button_short_value:
+          name: Aktion für einfachen Tastendruck
+          description: SONOFF SNZB-01P (Zigbee2MQTT) = "single".
+          default: single
+          selector:
+            text: {}
+        button_long_value:
+          name: Aktion für langen Tastendruck
+          description: SONOFF SNZB-01P (Zigbee2MQTT) = "long". Startet sofort, auch mit Netzbezug.
+          default: long
+          selector:
+            text: {}
+        auto_start_pending_helper:
+          name: "Helfer: wartet auf Start (input_boolean)"
+          description: Z.B. input_boolean.spulmaschine_bereit. Wird von der Automation verwaltet.
+          selector:
+            entity:
+              domain: input_boolean
+        peak_start_helper:
+          name: "Helfer: geplanter Start (input_datetime, Datum und Uhrzeit)"
+          description: >
+            Z.B. input_datetime.spuelmaschine_geplanter_start. Enthält den
+            geplanten Start (PV-Spitze, späteste Startzeit) oder das Ende der
+            Antwortfrist. Ruhezustand: 01.01.2000.
+          selector:
+            entity:
+              domain: input_datetime
+
+    notify_section:
+      name: Ansage und Benachrichtigung
+      icon: mdi:bullhorn
+      input:
+        speaker_entity:
+          name: Smart Speaker für Ansagen (optional)
+          description: Alexa-Gerät der Integration "Alexa Media Player" (HACS). Leer = nur Push.
+          default: ""
+          selector:
+            entity:
+              domain: media_player
+              integration: alexa_media
+        notify_device:
+          name: Benachrichtigungs-Gerät (Companion App)
+          selector:
+            device:
+              integration: mobile_app
+        answer_timeout_min:
+          name: Antwortfrist (Minuten)
+          description: >
+            Wird die Rückfrage innerhalb dieser Zeit nicht beantwortet, wird die
+            Standardauswahl ausgeführt. 0 = keine Frist.
+          default: 15
+          selector:
+            number:
+              min: 0
+              max: 240
+              step: 5
+              unit_of_measurement: min
+              mode: box
+        default_choice:
+          name: Standardauswahl ohne Antwort
+          description: >
+            "Zur PV-Spitze" fällt auf "Bei ausreichender Energie" zurück, wenn
+            keine Spitzenzeit bekannt ist.
+          default: peak
+          selector:
+            select:
+              options:
+                - label: Zur PV-Spitze
+                  value: peak
+                - label: Bei ausreichender Energie
+                  value: later
+                - label: Sofort starten
+                  value: now
+                - label: Nichts tun (nur erinnern)
+                  value: none
+
+    energy_section:
+      name: Energie und Akku
+      icon: mdi:home-battery
+      input:
+        appliance_energy_wh:
+          name: Geschätzter Energiebedarf pro Durchlauf (Wh)
+          description: Wird durch den gelernten Wert ersetzt, sobald einer vorliegt.
+          default: 1000
+          selector:
+            number:
+              min: 100
+              max: 10000
+              step: 50
+              unit_of_measurement: Wh
+              mode: box
+        appliance_peak_w:
+          name: Spitzenleistung des Geräts (W)
+          description: Leistung beim Aufheizen, z.B. 2000 W bei einer Spülmaschine.
+          default: 2000
+          selector:
+            number:
+              min: 100
+              max: 4000
+              step: 50
+              unit_of_measurement: W
+              mode: box
+        battery_max_discharge_w:
+          name: Maximale Entladeleistung des Akkus (W)
+          description: >
+            Laut Datenblatt deines Speichers bzw. Wechselrichters. Ist die
+            Spitzenleistung des Geräts höher, startet die Automation nur, wenn
+            gerade genug PV-Überschuss eingespeist wird, um die Differenz zu
+            decken. 0 = Prüfung aus.
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 20000
+              step: 100
+              unit_of_measurement: W
+              mode: box
+        battery_soc_sensor:
+          name: Akku-Ladestand-Sensor (SoC)
+          selector:
+            entity:
+              domain: sensor
+              device_class: battery
+        battery_capacity_wh:
+          name: Akku-Gesamtkapazität (Wh)
+          selector:
+            number:
+              min: 500
+              max: 50000
+              step: 100
+              unit_of_measurement: Wh
+              mode: box
+        battery_reserve_soc:
+          name: Akku-Reserve (%)
+          default: 20
+          selector:
+            number:
+              min: 0
+              max: 90
+              step: 5
+              unit_of_measurement: "%"
+              mode: slider
+        grid_power_sensor:
+          name: Netzbezug/-einspeisung-Sensor
+          selector:
+            entity:
+              domain: sensor
+        grid_import_is_positive:
+          name: Netzbezug ist positiver Wert
+          default: true
+          selector:
+            boolean: {}
+        pv_forecast_remaining_sensor:
+          name: PV-Restprognose heute (kWh)
+          description: Solcast "Prognose verbleibende Leistung heute" oder Forecast.Solar "Energieerzeugung heute - Rest".
+          selector:
+            entity:
+              domain: sensor
+
+    household_section:
+      name: Haushaltsverbrauch
+      icon: mdi:home-lightning-bolt
+      collapsed: true
+      input:
+        typical_daily_consumption_wh:
+          name: Üblicher Tagesverbrauch des Haushalts (Wh)
+          description: 0 = Haushaltsverbrauch nicht berücksichtigen.
+          default: 9000
+          selector:
+            number:
+              min: 0
+              max: 50000
+              step: 100
+              unit_of_measurement: Wh
+              mode: box
+        remaining_consumption_sensor:
+          name: Sensor für erwarteten Restverbrauch in kWh (optional)
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+        consumption_today_sensor:
+          name: Hausverbrauch heute (optional)
+          description: Tageszähler mit Reset um Mitternacht (Wh, kWh oder MWh).
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+
+    peak_section:
+      name: PV-Spitze
+      icon: mdi:white-balance-sunny
+      collapsed: true
+      input:
+        peak_time_today_sensor:
+          name: PV-Spitzenzeit heute (optional)
+          description: Solcast "Spitzenzeit heute" oder Forecast.Solar "power_highest_peak_time_today".
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+        peak_time_tomorrow_sensor:
+          name: PV-Spitzenzeit morgen (optional)
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+
+    run_section:
+      name: Laufüberwachung, Fertig-Meldung und Lernen
+      icon: mdi:chart-bell-curve
+      collapsed: true
+      input:
+        running_sensor:
+          name: Laufsensor (optional, z.B. WashData)
+          description: >
+            binary_sensor, der "an" ist, solange das Gerät läuft, z.B.
+            binary_sensor.spulmaschine_running der WashData-Integration. Ist er
+            gesetzt, erkennt die Automation Start und Ende darüber; die
+            Schwellen für den Leistungssensor werden dann nicht verwendet.
+          default: ""
+          selector:
+            entity:
+              domain: binary_sensor
+        remaining_time_sensor:
+          name: Restlaufzeit-Sensor in Minuten (optional, z.B. WashData)
+          description: >
+            Z.B. sensor.spulmaschine_time_remaining. Wird für die Ansage
+            "voraussichtlich fertig um ..." genutzt; ohne ihn gilt die
+            Programmdauer unten.
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+        power_sensor:
+          name: Leistungssensor des Steckers (optional)
+          description: >
+            Z.B. sensor.stecker_spuelmaschine_power. Wird für Start und Ende
+            genutzt, wenn kein Laufsensor gesetzt ist. Ohne Lauf- oder
+            Leistungssensor (und den Laufstatus-Helfer) gibt es keine
+            Fertig-Meldung, kein Lernen und keine Gerätesperre.
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+              device_class: power
+        energy_sensor:
+          name: Energiezähler des Steckers (optional, zum Lernen)
+          description: Gesamtzähler in Wh oder kWh, z.B. sensor.stecker_spuelmaschine_energy.
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+              device_class: energy
+        run_state_helper:
+          name: "Helfer: Laufstatus / Gerätesperre (input_text, optional)"
+          description: >
+            Z.B. input_text.geraete_laufstatus (maximale Länge 255). Bei
+            mehreren Geräten mit diesem Blueprint für alle denselben Helfer
+            wählen: Läuft ein Gerät, startet kein anderes automatisch.
+          default: ""
+          selector:
+            entity:
+              domain: input_text
+        learned_energy_helper:
+          name: "Helfer: gelernter Verbrauch in Wh (input_number, optional)"
+          description: >
+            Z.B. input_number.spuelmaschine_verbrauch (0 bis 10000, Schritt 1).
+            Wird nach jedem Durchlauf aktualisiert (gleitender Mittelwert).
+          default: ""
+          selector:
+            entity:
+              domain: input_number
+        running_threshold_w:
+          name: Läuft ab (W)
+          default: 5
+          selector:
+            number:
+              min: 1
+              max: 100
+              step: 1
+              unit_of_measurement: W
+              mode: box
+        starting_minutes:
+          name: Läuft, wenn so lange darüber (Minuten)
+          default: 2
+          selector:
+            number:
+              min: 1
+              max: 30
+              step: 1
+              unit_of_measurement: min
+              mode: box
+        finished_threshold_w:
+          name: Fertig unter (W)
+          default: 3
+          selector:
+            number:
+              min: 0.5
+              max: 50
+              step: 0.5
+              unit_of_measurement: W
+              mode: box
+        finishing_minutes:
+          name: Fertig, wenn so lange darunter (Minuten)
+          description: Spülmaschinen haben lange Trocknungspausen; bei falschen Fertig-Meldungen erhöhen.
+          default: 5
+          selector:
+            number:
+              min: 1
+              max: 120
+              step: 1
+              unit_of_measurement: min
+              mode: box
+        program_minutes:
+          name: Programmdauer für die Ansage (Minuten)
+          description: Für "voraussichtlich fertig um ...". 0 = keine Uhrzeit ansagen.
+          default: 205
+          selector:
+            number:
+              min: 0
+              max: 600
+              step: 5
+              unit_of_measurement: min
+              mode: box
+
+    time_section:
+      name: Zeitregeln
+      icon: mdi:clock-outline
+      collapsed: true
+      input:
+        window_start:
+          name: Automatische Starts frühestens um
+          default: "07:00:00"
+          selector:
+            time: {}
+        window_end:
+          name: Automatische Starts spätestens um
+          description: Gilt für Starts ohne dein Zutun. Tastendruck und "Sofort starten" gelten immer.
+          default: "21:00:00"
+          selector:
+            time: {}
+        max_wait_hours:
+          name: Späteste Startzeit bei "Bei ausreichender Energie" (Stunden)
+          description: >
+            Reicht die Energie bis dahin nicht, startet das Gerät trotzdem (im
+            Zeitfenster, sonst zum nächsten Fensterbeginn). 0 = unbegrenzt warten.
+          default: 24
+          selector:
+            number:
+              min: 0
+              max: 96
+              step: 1
+              unit_of_measurement: h
+              mode: box
+        check_interval_minutes:
+          name: Prüfintervall (Minuten)
+          default: 15
+          selector:
+            number:
+              min: 5
+              max: 60
+              step: 5
+              unit_of_measurement: min
+              mode: box
+
+mode: queued
+max: 10
+
+trigger_variables:
+  tv_running: !input running_sensor
+  tv_power: !input power_sensor
+  tv_run_thr: !input running_threshold_w
+  tv_fin_thr: !input finished_threshold_w
+
+triggers:
+  - trigger: state
+    entity_id: !input ready_button
+    not_from:
+      - unavailable
+    not_to:
+      - unavailable
+      - unknown
+    id: taster
+  - trigger: time_pattern
+    minutes: !input check_interval_minutes
+    id: periodisch
+  - trigger: event
+    event_type: mobile_app_notification_action
+    id: notification_antwort
+  - trigger: time
+    at: !input peak_start_helper
+    id: geplant
+  # Start/Ende über den Laufsensor (z.B. WashData)
+  - trigger: template
+    value_template: "{{ tv_running | string | length > 0 and is_state(tv_running, 'on') }}"
+    id: laeuft
+  - trigger: template
+    value_template: "{{ tv_running | string | length > 0 and is_state(tv_running, 'off') }}"
+    id: fertig
+  # Start/Ende über den Leistungssensor (nur ohne Laufsensor)
+  - trigger: template
+    value_template: >
+      {{ tv_running | string | length == 0 and tv_power | string | length > 0
+         and states(tv_power) | float(0) > tv_run_thr | float(5) }}
+    for:
+      minutes: !input starting_minutes
+    id: laeuft
+  - trigger: template
+    value_template: >
+      {{ tv_running | string | length == 0 and tv_power | string | length > 0
+         and states(tv_power) | is_number
+         and states(tv_power) | float(0) < tv_fin_thr | float(3) }}
+    for:
+      minutes: !input finishing_minutes
+    id: fertig
+
+variables:
+  appliance_name: !input appliance_name
+  appliance_switch: !input appliance_switch
+  button_short_value: !input button_short_value
+  button_long_value: !input button_long_value
+  auto_start_pending_helper: !input auto_start_pending_helper
+  peak_start_helper: !input peak_start_helper
+  speaker_entity: !input speaker_entity
+  speaker_enabled: "{{ speaker_entity | string | length > 0 }}"
+  notify_device: !input notify_device
+  notify_action: "notify.mobile_app_{{ device_attr(notify_device, 'name') | slugify }}"
+  answer_timeout_min: !input answer_timeout_min
+  default_choice: !input default_choice
+  appliance_energy_wh: !input appliance_energy_wh
+  appliance_peak_w: !input appliance_peak_w
+  battery_max_discharge_w: !input battery_max_discharge_w
+  battery_soc_sensor: !input battery_soc_sensor
+  battery_capacity_wh: !input battery_capacity_wh
+  battery_reserve_soc: !input battery_reserve_soc
+  grid_power_sensor: !input grid_power_sensor
+  grid_import_is_positive: !input grid_import_is_positive
+  pv_forecast_remaining_sensor: !input pv_forecast_remaining_sensor
+  typical_daily_consumption_wh: !input typical_daily_consumption_wh
+  remaining_consumption_sensor: !input remaining_consumption_sensor
+  consumption_today_sensor: !input consumption_today_sensor
+  peak_time_today_sensor: !input peak_time_today_sensor
+  peak_time_tomorrow_sensor: !input peak_time_tomorrow_sensor
+  running_sensor: !input running_sensor
+  remaining_time_sensor: !input remaining_time_sensor
+  power_sensor: !input power_sensor
+  energy_sensor: !input energy_sensor
+  run_state_helper: !input run_state_helper
+  learned_energy_helper: !input learned_energy_helper
+  finished_threshold_w: !input finished_threshold_w
+  finishing_minutes: !input finishing_minutes
+  program_minutes: !input program_minutes
+  window_start: !input window_start
+  window_end: !input window_end
+  max_wait_hours: !input max_wait_hours
+  action_start_now: "START_NOW_{{ appliance_switch }}"
+  action_start_later: "START_LATER_{{ appliance_switch }}"
+  action_start_peak: "START_PEAK_{{ appliance_switch }}|"
+  idle_datetime: "2000-01-01 00:00:00"
+
+actions:
+  - variables:
+      # ---------- Sensoren (Punkt 4: Ausfälle erkennen)
+      sensors_ok: >
+        {{ states(battery_soc_sensor) | is_number
+           and states(grid_power_sensor) | is_number
+           and states(pv_forecast_remaining_sensor) | is_number }}
+      soc: "{{ states(battery_soc_sensor) | float(0) }}"
+      grid_power: "{{ states(grid_power_sensor) | float(0) }}"
+      surplus_w: "{{ (grid_power * -1) if grid_import_is_positive else grid_power }}"
+      available_battery_wh: >
+        {{ [((soc - battery_reserve_soc) / 100 * battery_capacity_wh), 0] | max }}
+      forecast_remaining_wh: "{{ (states(pv_forecast_remaining_sensor) | float(0)) * 1000 }}"
+      # ---------- Verbrauch des Geräts (Punkt 6: gelernter Wert)
+      learned_wh: >
+        {{ states(learned_energy_helper) | float(0) if learned_energy_helper | string | length > 0 else 0 }}
+      effective_energy_wh: "{{ learned_wh if learned_wh >= 100 else appliance_energy_wh }}"
+      # ---------- Haushalts-Restverbrauch bis Mitternacht
+      remaining_consumption_raw: >-
+        {%- set elapsed = (now().hour + now().minute / 60) / 24 -%}
+        {%- set typical = typical_daily_consumption_wh | float(0) -%}
+        {%- set prior = typical * (1 - elapsed) -%}
+        {%- if remaining_consumption_sensor | string | length > 0 -%}
+          {{ (states(remaining_consumption_sensor) | float(0)) * 1000 }}
+        {%- elif consumption_today_sensor | string | length > 0
+                 and typical > 0 and elapsed >= 0.25
+                 and states(consumption_today_sensor) | is_number -%}
+          {%- set unit = state_attr(consumption_today_sensor, 'unit_of_measurement') -%}
+          {%- set factor = 1 if unit == 'Wh' else (1000000 if unit == 'MWh' else 1000) -%}
+          {%- set consumed = (states(consumption_today_sensor) | float(0)) * factor -%}
+          {%- set ratio = [[consumed / (typical * elapsed), 0.5] | max, 1.5] | min -%}
+          {{ prior * ratio }}
+        {%- else -%}
+          {{ prior }}
+        {%- endif -%}
+      remaining_consumption_wh: "{{ remaining_consumption_raw | float(0) }}"
+      total_available_wh: >
+        {{ available_battery_wh + forecast_remaining_wh - remaining_consumption_wh }}
+      day_will_be_enough: "{{ sensors_ok and total_available_wh >= effective_energy_wh }}"
+      # ---------- Punkt 5: reicht die Entladeleistung für die Aufheizspitze?
+      power_ok: >
+        {{ battery_max_discharge_w | float(0) <= 0
+           or battery_max_discharge_w | float(0) + [surplus_w, 0] | max >= appliance_peak_w | float(0) }}
+      # ---------- Punkt 10: Laufstatus / Gerätesperre
+      run_state: >
+        {{ states(run_state_helper) if run_state_helper | string | length > 0 else '' }}
+      run_owner: "{{ (run_state | string).split('|')[0] }}"
+      own_running: "{{ run_owner == appliance_switch }}"
+      other_running: "{{ run_owner not in ['', 'unknown', 'unavailable', appliance_switch] }}"
+      use_running_sensor: "{{ running_sensor | string | length > 0 }}"
+      tracking: >
+        {{ run_state_helper | string | length > 0
+           and (running_sensor | string | length > 0 or power_sensor | string | length > 0) }}
+      # ---------- Startentscheidung
+      can_start_now: >
+        {{ sensors_ok and surplus_w >= 0 and available_battery_wh >= effective_energy_wh
+           and day_will_be_enough and power_ok and not other_running }}
+      pending_on: "{{ is_state(auto_start_pending_helper, 'on') }}"
+      relay_on: "{{ is_state(appliance_switch, 'on') }}"
+      # ---------- Punkt 7: Zeitfenster für automatische Starts
+      in_window: >
+        {{ window_start <= now().strftime('%H:%M:%S') <= window_end }}
+      # ---------- Punkt 8: späteste Startzeit (in das Zeitfenster verschoben)
+      deadline_ts: >-
+        {%- if max_wait_hours | float(0) > 0 -%}
+          {%- set d = now() + timedelta(hours=max_wait_hours | float(0)) -%}
+          {%- set ws = window_start.split(':') -%}
+          {%- set we = window_end.split(':') -%}
+          {%- set s = d.replace(hour=ws[0] | int, minute=ws[1] | int, second=0, microsecond=0) -%}
+          {%- set e = d.replace(hour=we[0] | int, minute=we[1] | int, second=0, microsecond=0) -%}
+          {%- if d < s -%}{%- set d = s -%}{%- elif d > e -%}{%- set d = s + timedelta(days=1) -%}{%- endif -%}
+          {{ d.timestamp() | int }}
+        {%- endif -%}
+      # ---------- PV-Spitze: heute, wenn noch >= 10 Minuten entfernt, sonst morgen
+      peak_ts: >-
+        {%- set ns = namespace(ts='') -%}
+        {%- for s in [peak_time_today_sensor, peak_time_tomorrow_sensor] -%}
+          {%- set d = states(s) | as_datetime(none) if s | string | length > 0 else none -%}
+          {%- if ns.ts == '' and d is not none -%}
+            {%- set d = d if d.tzinfo is not none else d | as_local -%}
+            {%- if d > now() + timedelta(minutes=10) -%}
+              {%- set ns.ts = d.timestamp() | int | string -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{ ns.ts }}
+      peak_label: >-
+        {%- if peak_ts | string | length > 0 -%}
+          {%- set ts = peak_ts | int -%}
+          {{ 'heute' if ts | timestamp_custom('%Y-%m-%d') == now().strftime('%Y-%m-%d') else 'morgen' }} {{ ts | timestamp_custom('%H:%M') }}
+        {%- endif -%}
+      button_value: >
+        {{ (trigger.to_state.attributes.get('event_type', trigger.to_state.state)
+            if trigger.id == 'taster' else '') | string }}
+
+  - choose:
+      # =================================================================
+      # T) Taster gedrückt
+      # =================================================================
+      - conditions:
+          - condition: trigger
+            id: taster
+          - condition: template
+            value_template: >
+              {{ button_value in [button_short_value, button_long_value]
+                 and button_value not in ['', 'none', 'unknown', 'unavailable'] }}
+        sequence:
+          - variables:
+              long_press: "{{ button_value == button_long_value }}"
+          - action: input_boolean.turn_off
+            target:
+              entity_id: "{{ auto_start_pending_helper }}"
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: "{{ peak_start_helper }}"
+            data:
+              datetime: "{{ idle_datetime }}"
+          - action: switch.turn_on
+            target:
+              entity_id: "{{ appliance_switch }}"
+          - choose:
+              # T1) Langer Druck -> sofort
+              - conditions: "{{ long_press }}"
+                sequence:
+                  - if: "{{ speaker_enabled }}"
+                    then:
+                      - action: notify.alexa_media
+                        continue_on_error: true
+                        data:
+                          message: "{{ appliance_name }} startet"
+                          data:
+                            type: announce
+                          target: "{{ speaker_entity }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ appliance_name }} startet per langem Tastendruck sofort.
+                        Netzbezug wird dabei in Kauf genommen.
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+              # T2) Genug Energie -> starten
+              - conditions: "{{ can_start_now }}"
+                sequence:
+                  - if: "{{ speaker_enabled }}"
+                    then:
+                      - action: notify.alexa_media
+                        continue_on_error: true
+                        data:
+                          message: "{{ appliance_name }} startet"
+                          data:
+                            type: announce
+                          target: "{{ speaker_entity }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ appliance_name }} startet - genug PV-Überschuss bzw.
+                        Akkureserve vorhanden, kein Netzbezug erwartet.
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+            # T3) Rückfrage
+            default:
+              - variables:
+                  reason: >-
+                    {%- if not sensors_ok -%}
+                      Achtung: Akku-, Netz- oder Prognosesensor ist nicht verfügbar, die Energie kann nicht bewertet werden.
+                    {%- elif other_running -%}
+                      Ein anderes Gerät läuft gerade.
+                    {%- elif not power_ok -%}
+                      Der Akku kann die Aufheizleistung ({{ appliance_peak_w | int }} W) nicht allein liefern.
+                    {%- else -%}
+                      Aktuell reicht der Solarüberschuss bzw. die Akkureserve nicht aus
+                      {{- ' (laut Bilanz reicht es im Tagesverlauf)' if day_will_be_enough else ' (auch die Tagesbilanz reicht voraussichtlich nicht)' }}.
+                    {%- endif -%}
+                  balance: >-
+                    Bilanz: Akku {{ available_battery_wh | round(0) | int }} Wh
+                    + Prognose {{ forecast_remaining_wh | round(0) | int }} Wh
+                    - Haushalt {{ remaining_consumption_wh | round(0) | int }} Wh
+                    = {{ total_available_wh | round(0) | int }} Wh,
+                    Bedarf {{ effective_energy_wh | round(0) | int }} Wh{{ ' (gelernt)' if learned_wh >= 100 else '' }}.
+                  timeout_text: >-
+                    {%- if answer_timeout_min | int(0) > 0 and default_choice != 'none' -%}
+                      Ohne Antwort in {{ answer_timeout_min | int }} Minuten:
+                      {{ {'peak': 'Start zur PV-Spitze', 'later': 'Start bei ausreichender Energie', 'now': 'Start sofort'}[default_choice] }}.
+                    {%- endif -%}
+              - if: "{{ speaker_enabled }}"
+                then:
+                  - action: notify.alexa_media
+                    continue_on_error: true
+                    data:
+                      message: >
+                        {{ appliance_name }}: Die Energie reicht gerade nicht. Bitte am
+                        Handy wählen: sofort, bei ausreichender Energie
+                        {{- (' oder zur PV-Spitze ' ~ peak_label ~ ' Uhr') if peak_label else '' }}.
+                      data:
+                        type: announce
+                      target: "{{ speaker_entity }}"
+              - if: "{{ peak_ts | string | length > 0 }}"
+                then:
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ appliance_name }} ist bereit. {{ reason }} {{ balance }}
+                        Nächste PV-Spitze: {{ peak_label }} Uhr. {{ timeout_text }}
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+                        actions:
+                          - action: "{{ action_start_now }}"
+                            title: Sofort starten
+                          - action: "{{ action_start_later }}"
+                            title: Bei ausreichender Energie
+                          - action: "{{ action_start_peak ~ peak_ts }}"
+                            title: "Zur PV-Spitze ({{ peak_label }})"
+                else:
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ appliance_name }} ist bereit. {{ reason }} {{ balance }}
+                        {{ timeout_text }}
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+                        actions:
+                          - action: "{{ action_start_now }}"
+                            title: Sofort starten
+                          - action: "{{ action_start_later }}"
+                            title: Bei ausreichender Energie
+              # Punkt 9: Antwortfrist über den Zeit-Helfer (wartet-Helfer bleibt aus)
+              - if: "{{ answer_timeout_min | int(0) > 0 }}"
+                then:
+                  - action: input_datetime.set_datetime
+                    target:
+                      entity_id: "{{ peak_start_helper }}"
+                    data:
+                      timestamp: "{{ (as_timestamp(now()) + answer_timeout_min | int * 60) | int }}"
+
+      # =================================================================
+      # B) Entscheidung: Button-Antwort oder abgelaufene Antwortfrist
+      # =================================================================
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ (trigger.id == 'notification_antwort'
+                  and trigger.event.data.action is string
+                  and (trigger.event.data.action in [action_start_now, action_start_later]
+                       or trigger.event.data.action.startswith(action_start_peak)))
+                 or (trigger.id == 'geplant' and not pending_on) }}
+        sequence:
+          - variables:
+              timed_out: "{{ trigger.id == 'geplant' }}"
+              act: "{{ trigger.event.data.action if trigger.id == 'notification_antwort' else '' }}"
+              choice: >-
+                {%- if not timed_out -%}
+                  {{ 'now' if act == action_start_now else ('later' if act == action_start_later else 'peak') }}
+                {%- elif default_choice == 'peak' and peak_ts | string | length == 0 -%}
+                  later
+                {%- else -%}
+                  {{ default_choice }}
+                {%- endif -%}
+              chosen_ts: >-
+                {%- if choice != 'peak' -%}0
+                {%- elif not timed_out -%}{{ act.split('|')[-1] | int(0) }}
+                {%- else -%}{{ peak_ts | int(0) }}
+                {%- endif -%}
+              prefix: "{{ 'Keine Antwort erhalten. ' if timed_out else '' }}"
+          - choose:
+              # B1) Sofort starten
+              - conditions: "{{ choice == 'now' }}"
+                sequence:
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ appliance_switch }}"
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id: "{{ auto_start_pending_helper }}"
+                  - action: input_datetime.set_datetime
+                    target:
+                      entity_id: "{{ peak_start_helper }}"
+                    data:
+                      datetime: "{{ idle_datetime }}"
+                  - if: "{{ speaker_enabled }}"
+                    then:
+                      - action: notify.alexa_media
+                        continue_on_error: true
+                        data:
+                          message: "{{ appliance_name }} startet"
+                          data:
+                            type: announce
+                          target: "{{ speaker_entity }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: "{{ prefix }}{{ appliance_name }} startet jetzt (ggf. mit Netzbezug)."
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+              # B2) Bei ausreichender Energie (mit spätester Startzeit)
+              - conditions: "{{ choice == 'later' }}"
+                sequence:
+                  - action: input_boolean.turn_on
+                    target:
+                      entity_id: "{{ auto_start_pending_helper }}"
+                  - action: input_datetime.set_datetime
+                    target:
+                      entity_id: "{{ peak_start_helper }}"
+                    data:
+                      timestamp: >
+                        {{ deadline_ts | int if deadline_ts | string | length > 0
+                           else as_timestamp(idle_datetime) | int }}
+                  - action: switch.turn_off
+                    target:
+                      entity_id: "{{ appliance_switch }}"
+                  - variables:
+                      deadline_label: >-
+                        {%- if deadline_ts | string | length > 0 -%}
+                          {%- set ts = deadline_ts | int -%}
+                          {{ 'heute' if ts | timestamp_custom('%Y-%m-%d') == now().strftime('%Y-%m-%d')
+                             else ('morgen' if ts | timestamp_custom('%Y-%m-%d') == (now() + timedelta(days=1)).strftime('%Y-%m-%d')
+                             else ts | timestamp_custom('am %d.%m.')) }} um {{ ts | timestamp_custom('%H:%M') }} Uhr
+                        {%- endif -%}
+                  - if: "{{ speaker_enabled }}"
+                    then:
+                      - action: notify.alexa_media
+                        continue_on_error: true
+                        data:
+                          message: "{{ appliance_name }} startet bei ausreichender Energie"
+                          data:
+                            type: announce
+                          target: "{{ speaker_entity }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ prefix }}{{ appliance_name }} startet bei ausreichender Energie
+                        (zwischen {{ window_start[:5] }} und {{ window_end[:5] }} Uhr)
+                        {{- (', spätestens ' ~ deadline_label) if deadline_label else '' }}.
+                        Das Relais ist bis dahin aus. Langer Tastendruck startet sofort.
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+              # B3) Zur PV-Spitze (früher, falls vorher genug Energie da ist)
+              - conditions: "{{ choice == 'peak' and chosen_ts | int > as_timestamp(now()) }}"
+                sequence:
+                  - variables:
+                      chosen_label: >-
+                        {%- set ts = chosen_ts | int -%}
+                        {{ 'heute' if ts | timestamp_custom('%Y-%m-%d') == now().strftime('%Y-%m-%d') else 'morgen' }} um {{ ts | timestamp_custom('%H:%M') }}
+                  - action: input_datetime.set_datetime
+                    target:
+                      entity_id: "{{ peak_start_helper }}"
+                    data:
+                      timestamp: "{{ chosen_ts | int }}"
+                  - action: input_boolean.turn_on
+                    target:
+                      entity_id: "{{ auto_start_pending_helper }}"
+                  - action: switch.turn_off
+                    target:
+                      entity_id: "{{ appliance_switch }}"
+                  - if: "{{ speaker_enabled }}"
+                    then:
+                      - action: notify.alexa_media
+                        continue_on_error: true
+                        data:
+                          message: "{{ appliance_name }} startet {{ chosen_label }} Uhr"
+                          data:
+                            type: announce
+                          target: "{{ speaker_entity }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ prefix }}{{ appliance_name }} startet {{ chosen_label }} Uhr zur
+                        PV-Spitze, früher, falls vorher genug Energie da ist. Das Relais
+                        ist bis dahin aus. Langer Tastendruck startet sofort.
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+              # B4) PV-Spitze inzwischen vorbei -> sofort
+              - conditions: "{{ choice == 'peak' }}"
+                sequence:
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ appliance_switch }}"
+                  - action: input_datetime.set_datetime
+                    target:
+                      entity_id: "{{ peak_start_helper }}"
+                    data:
+                      datetime: "{{ idle_datetime }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: "{{ prefix }}Die PV-Spitze ist schon vorbei, {{ appliance_name }} startet jetzt."
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
+            # B5) Standardauswahl "Nichts tun" -> nur erinnern
+            default:
+              - action: input_datetime.set_datetime
+                target:
+                  entity_id: "{{ peak_start_helper }}"
+                data:
+                  datetime: "{{ idle_datetime }}"
+              - action: "{{ notify_action }}"
+                data:
+                  message: >
+                    Keine Antwort erhalten. {{ appliance_name }} ist bereit, startet aber
+                    nicht automatisch. Taster kurz drücken für eine neue Abfrage, lang
+                    für den Sofortstart.
+                  data:
+                    tag: "pv_start_{{ appliance_switch }}"
+
+      # =================================================================
+      # S) Geplanter Start (PV-Spitze oder späteste Startzeit)
+      # =================================================================
+      - conditions:
+          - condition: trigger
+            id: geplant
+          - condition: template
+            value_template: "{{ pending_on }}"
+        sequence:
+          - if: "{{ other_running }}"
+            then:
+              # Punkt 10: anderes Gerät läuft -> 15 Minuten später erneut
+              - action: input_datetime.set_datetime
+                target:
+                  entity_id: "{{ peak_start_helper }}"
+                data:
+                  timestamp: "{{ (as_timestamp(now()) + 900) | int }}"
+            else:
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: "{{ auto_start_pending_helper }}"
+              - action: input_datetime.set_datetime
+                target:
+                  entity_id: "{{ peak_start_helper }}"
+                data:
+                  datetime: "{{ idle_datetime }}"
+              - action: switch.turn_on
+                target:
+                  entity_id: "{{ appliance_switch }}"
+              - if: "{{ speaker_enabled }}"
+                then:
+                  - action: notify.alexa_media
+                    continue_on_error: true
+                    data:
+                      message: "{{ appliance_name }} startet"
+                      data:
+                        type: announce
+                      target: "{{ speaker_entity }}"
+              - action: "{{ notify_action }}"
+                data:
+                  message: >
+                    {{ appliance_name }} startet jetzt wie geplant
+                    (Akku {{ soc | round(0) | int }} %, ggf. mit etwas Netzbezug).
+                  data:
+                    tag: "pv_start_{{ appliance_switch }}"
+
+      # =================================================================
+      # L) Gerät läuft (Leistung über Schwelle) -> Laufstatus setzen
+      # =================================================================
+      - conditions:
+          - condition: trigger
+            id: laeuft
+          - condition: template
+            value_template: "{{ tracking and run_owner in ['', 'unknown'] }}"
+        sequence:
+          - variables:
+              start_energy: >
+                {%- if energy_sensor | string | length > 0 and states(energy_sensor) | is_number -%}
+                  {{ states(energy_sensor) | float }}
+                {%- else -%}-1{%- endif -%}
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ run_state_helper }}"
+            data:
+              value: "{{ appliance_switch }}|{{ start_energy }}"
+          - if: "{{ remaining_time_sensor | string | length > 0 }}"
+            then:
+              # Die Restlaufzeit steht oft erst kurz nach dem Start fest
+              - wait_template: "{{ states(remaining_time_sensor) | int(0) > 0 }}"
+                timeout: "00:01:00"
+                continue_on_timeout: true
+          - variables:
+              rest_min: >
+                {{ states(remaining_time_sensor) | int(0) if remaining_time_sensor | string | length > 0 else 0 }}
+              duration_min: "{{ rest_min if rest_min > 0 else program_minutes | int(0) }}"
+          - if: "{{ duration_min > 0 }}"
+            then:
+              - variables:
+                  end_label: "{{ (now() + timedelta(minutes=duration_min)).strftime('%H:%M') }}"
+              - if: "{{ speaker_enabled }}"
+                then:
+                  - action: notify.alexa_media
+                    continue_on_error: true
+                    data:
+                      message: "{{ appliance_name }} läuft und ist voraussichtlich um {{ end_label }} Uhr fertig."
+                      data:
+                        type: announce
+                      target: "{{ speaker_entity }}"
+
+      # =================================================================
+      # F) Fertig (Punkt 1) inkl. Lernen (Punkt 6). Auch als Nachholprüfung,
+      #    falls die Fertig-Meldung z.B. durch einen Neustart verpasst wurde.
+      # =================================================================
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ tracking and own_running and relay_on and not pending_on
+                 and (trigger.id == 'fertig'
+                      or (trigger.id == 'periodisch' and use_running_sensor
+                          and is_state(running_sensor, 'off')
+                          and as_timestamp(now()) - as_timestamp(states[running_sensor].last_changed) > 120)
+                      or (trigger.id == 'periodisch' and not use_running_sensor
+                          and states(power_sensor) | is_number
+                          and states(power_sensor) | float(0) < finished_threshold_w | float(3)
+                          and as_timestamp(now()) - as_timestamp(states[power_sensor].last_changed)
+                              > finishing_minutes | int * 60)) }}
+        sequence:
+          - variables:
+              start_energy: "{{ (run_state | string).split('|')[-1] | float(-1) }}"
+              energy_factor: >
+                {{ 1 if state_attr(energy_sensor, 'unit_of_measurement') == 'Wh' else 1000 }}
+              consumed_wh: >
+                {%- if energy_sensor | string | length > 0 and start_energy >= 0
+                       and states(energy_sensor) | is_number -%}
+                  {{ ((states(energy_sensor) | float - start_energy) * energy_factor) | round(0) }}
+                {%- else -%}0{%- endif -%}
+              valid_measure: "{{ 50 <= consumed_wh | float(0) <= 20000 }}"
+              new_learned: >
+                {{ ((learned_wh * 0.7 + consumed_wh | float * 0.3) if learned_wh >= 100 else consumed_wh | float) | round(0) }}
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ run_state_helper }}"
+            data:
+              value: ""
+          - if: "{{ valid_measure and learned_energy_helper | string | length > 0 }}"
+            then:
+              - action: input_number.set_value
+                target:
+                  entity_id: "{{ learned_energy_helper }}"
+                data:
+                  value: "{{ new_learned }}"
+          - if: "{{ speaker_enabled }}"
+            then:
+              - action: notify.alexa_media
+                continue_on_error: true
+                data:
+                  message: "{{ appliance_name }} ist fertig, bitte ausräumen!"
+                  data:
+                    type: announce
+                  target: "{{ speaker_entity }}"
+          - action: "{{ notify_action }}"
+            data:
+              message: >
+                {{ appliance_name }} ist fertig.
+                {{- (' Verbrauch: ' ~ consumed_wh | int ~ ' Wh.') if valid_measure else '' }}
+                {{- (' Gelernter Durchschnitt: ' ~ new_learned | int ~ ' Wh.')
+                    if valid_measure and learned_energy_helper | string | length > 0 else '' }}
+              data:
+                tag: "pv_start_{{ appliance_switch }}"
+
+      # =================================================================
+      # P) Hintergrundprüfung für den vorgemerkten Start
+      # =================================================================
+      - conditions:
+          - condition: trigger
+            id: periodisch
+          - condition: template
+            value_template: "{{ pending_on }}"
+        sequence:
+          - choose:
+              # P1) Relais wurde anders eingeschaltet -> Vormerkung löschen
+              - conditions: "{{ relay_on }}"
+                sequence:
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id: "{{ auto_start_pending_helper }}"
+                  - action: input_datetime.set_datetime
+                    target:
+                      entity_id: "{{ peak_start_helper }}"
+                    data:
+                      datetime: "{{ idle_datetime }}"
+              # P2) Genug Energie und im Zeitfenster -> starten
+              - conditions: "{{ can_start_now and in_window }}"
+                sequence:
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ appliance_switch }}"
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id: "{{ auto_start_pending_helper }}"
+                  - action: input_datetime.set_datetime
+                    target:
+                      entity_id: "{{ peak_start_helper }}"
+                    data:
+                      datetime: "{{ idle_datetime }}"
+                  - if: "{{ speaker_enabled }}"
+                    then:
+                      - action: notify.alexa_media
+                        continue_on_error: true
+                        data:
+                          message: "{{ appliance_name }} startet"
+                          data:
+                            type: announce
+                          target: "{{ speaker_entity }}"
+                  - action: "{{ notify_action }}"
+                    data:
+                      message: >
+                        {{ appliance_name }} startet jetzt - genug PV-Überschuss bzw.
+                        Akkureserve vorhanden, kein Netzbezug erwartet.
+                      data:
+                        tag: "pv_start_{{ appliance_switch }}"
